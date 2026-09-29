@@ -691,18 +691,62 @@
         }
 
         // ==========================================
-        // 6. GENERATION SIMULATION (API MOCK)
+        // 6. GENERATION API LOGIC (REPLICATE)
         // ==========================================
+
+        async function fetchFromReplicate(modelStr, inputParams, apiKey) {
+            const url = `https://api.replicate.com/v1/models/${modelStr}/predictions`;
+            const headers = {
+                "Authorization": `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+                "Prefer": "wait"
+            };
+            const body = { input: inputParams };
+
+            // 1. Crear Predicción
+            let response = await fetch(url, {
+                method: "POST",
+                headers: headers,
+                body: JSON.stringify(body)
+            });
+
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({}));
+                throw new Error(err.detail || err.error || `Error HTTP ${response.status}: Verifica tu API Key.`);
+            }
+
+            let prediction = await response.json();
+
+            // 2. Hacer polling hasta que termine
+            while (prediction.status !== "succeeded" && prediction.status !== "failed" && prediction.status !== "canceled") {
+                await new Promise(r => setTimeout(r, 1500));
+                const pollResponse = await fetch(prediction.urls.get, { headers });
+                if (!pollResponse.ok) {
+                    throw new Error("Error consultando el estado a Replicate.");
+                }
+                prediction = await pollResponse.json();
+            }
+
+            if (prediction.status === "failed" || prediction.status === "canceled") {
+                throw new Error("La generación falló: " + (prediction.error || "Operación cancelada"));
+            }
+
+            // FLUX models usually return an array of strings
+            return Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+        }
         
+        function showError(message) {
+            document.getElementById('alert-modal-text').innerText = message;
+            document.getElementById('alert-modal').classList.remove('hidden');
+        }
+
         // Text-to-Image Generation
         document.getElementById('btn-generate-t2i').addEventListener('click', async () => {
-            // 1. Verify Configuration!
             if(!validateConfigBeforeGeneration()) return;
             
             const prompt = document.getElementById('t2i-prompt').value;
             if(!prompt.trim()) { 
-                document.getElementById('alert-modal-text').innerText = "Por favor, ingresa un prompt descriptivo antes de generar.";
-                document.getElementById('alert-modal').classList.remove('hidden');
+                showError("Por favor, ingresa un prompt descriptivo antes de generar.");
                 return; 
             }
 
@@ -718,40 +762,55 @@
             t2iActions.classList.add('hidden');
             t2iLoading.classList.remove('hidden');
 
-            // Simulation logic
-            const seedVal = document.getElementById('t2i-seed').value;
-            const seed = seedVal === '-1' || !seedVal ? Math.floor(Math.random()*10000) : seedVal;
-            const resVal = document.getElementById('t2i-res').value.split('x');
-            const w = resVal[0], h = resVal[1];
-            
-            const steps = document.getElementById('t2i-steps').value;
-            const delay = Math.min(parseInt(steps) * 100, 3000); 
-
-            setTimeout(() => {
-                const fakeImgUrl = `https://picsum.photos/seed/${seed}/${w}/${h}`;
-                t2iResult.src = fakeImgUrl;
+            try {
+                const apiKey = localStorage.getItem(API_KEY_KEY);
+                const resVal = document.getElementById('t2i-res').value;
+                const seedVal = document.getElementById('t2i-seed').value;
                 
+                // Utilizamos el modelo abierto puntero FLUX.1-schnell
+                const model = "black-forest-labs/flux-schnell";
+                const inputParams = {
+                    prompt: prompt,
+                    aspect_ratio: resVal === "512x512" || resVal === "768x768" || resVal === "1024x1024" ? "1:1" : 
+                                  resVal === "1920x1080" ? "16:9" : "9:16",
+                    output_format: "webp"
+                };
+
+                if (seedVal && seedVal !== "-1") {
+                    inputParams.seed = parseInt(seedVal);
+                }
+
+                const imageUrl = await fetchFromReplicate(model, inputParams, apiKey);
+                
+                if (!imageUrl) throw new Error("No se devolvió ninguna imagen.");
+
+                t2iResult.src = imageUrl;
                 t2iResult.onload = () => {
                     t2iLoading.classList.add('hidden');
                     t2iResult.classList.remove('hidden');
                     t2iActions.classList.remove('hidden');
-                    addToGallery(fakeImgUrl);
+                    addToGallery(imageUrl);
                 };
-            }, delay);
+            } catch (err) {
+                t2iLoading.classList.add('hidden');
+                t2iPlaceholder.classList.remove('hidden');
+                showError("Error de API: " + err.message);
+            }
         });
-
 
         // Image-to-Image Generation
         document.getElementById('btn-generate-i2i').addEventListener('click', async () => {
-            // 1. Verify Configuration!
             if(!validateConfigBeforeGeneration()) return;
             
             const prompt = document.getElementById('i2i-prompt').value;
             const srcImg = document.getElementById('i2i-preview-src').src;
             
             if(!srcImg || srcImg === window.location.href) {
-                document.getElementById('alert-modal-text').innerText = "Sube una imagen de referencia primero.";
-                document.getElementById('alert-modal').classList.remove('hidden');
+                showError("Sube una imagen de referencia primero.");
+                return;
+            }
+            if(!prompt.trim()) {
+                showError("Ingresa un prompt para modificar la imagen.");
                 return;
             }
 
@@ -766,20 +825,38 @@
             i2iActions.classList.add('hidden');
             i2iLoading.classList.remove('hidden');
 
-            const delay = 2500;
-            const seed = Math.floor(Math.random()*10000);
-            
-            setTimeout(() => {
-                const fakeImgUrl = `https://picsum.photos/seed/${seed}/800/800`;
-                i2iResult.src = fakeImgUrl;
+            try {
+                const apiKey = localStorage.getItem(API_KEY_KEY);
+                const denoise = parseFloat(document.getElementById('i2i-denoise').value);
+                const steps = parseInt(document.getElementById('i2i-steps').value);
                 
+                // Modelo alternativo para Image-to-Image en Replicate
+                const model = "lucataco/flux-dev-img2img";
+                
+                const inputParams = {
+                    prompt: prompt,
+                    image: srcImg, // Base64 string from drag&drop
+                    strength: denoise, // 0 to 1
+                    steps: steps,
+                    output_format: "webp"
+                };
+
+                const imageUrl = await fetchFromReplicate(model, inputParams, apiKey);
+                
+                if (!imageUrl) throw new Error("No se devolvió ninguna imagen.");
+
+                i2iResult.src = imageUrl;
                 i2iResult.onload = () => {
                     i2iLoading.classList.add('hidden');
                     i2iResult.classList.remove('hidden');
                     i2iActions.classList.remove('hidden');
-                    addToGallery(fakeImgUrl);
+                    addToGallery(imageUrl);
                 };
-            }, delay);
+            } catch (err) {
+                i2iLoading.classList.add('hidden');
+                i2iPlaceholder.classList.remove('hidden');
+                showError("Error de API: " + err.message);
+            }
         });
 
         // ==========================================
